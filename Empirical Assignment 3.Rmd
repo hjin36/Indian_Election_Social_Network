@@ -1,0 +1,213 @@
+---
+title: "Empirical Assignment 3"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, warning=FALSE,message=FALSE}
+# Environment preperation & Loading Packages
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plm)
+library(stargazer)
+library(pglm)
+library(lmtest)
+library(panelAR)
+```
+
+
+```{r}
+# Loading data into data tables
+raindt <- fread("rain_information.csv")
+borderdt <- fread("border_information.csv")
+districtdt <- fread("district_information.csv")
+newParty <- fread("new_parties_in_each_district_by_candidate.csv")
+```
+
+## Diffusion of political parties founded after droughts in India
+
+### 1A
+
+```{r}
+# creating window
+eyear <- unique(districtdt$year)[order( unique(districtdt$year))]
+syear <- nafill(shift(eyear,type='lag',n=1),type = "const",fill=1945)
+districtdt[,window := as.factor(unlist(lapply(year, function(x) which(x == eyear)))),]
+# calculate for each district, each election period, total rain and average spi
+raindt <- raindt[year<=1999][, window := as.factor(unlist(lapply(year,function(x) which(x > syear & x <= eyear))))]
+rain_amount <- raindt[,.(total_rain = sum(rain,na.rm=TRUE),avg_spi = mean(spi,na.rm=TRUE)),by=.(district,window)]
+dt <- as.data.table(left_join(districtdt,rain_amount,by=c("district","window")))
+par(mfrow=c(1,2),oma = c(0, 0, 3, 0))
+plot(dt$total_rain,dt$new_parties,ylim=c(0,12),main =  'Total Rainfall',xlab = 'Total Rainfall (in millimeters)',ylab = 'Number of Parties Formed')
+plot(dt$avg_spi,dt$new_parties,ylim=c(0,12),main =  'Average SPI',xlab = 'Average SPI',ylab = 'Number of Parties Formed')
+mtext("Number of New Parties Formed v.s. Level of Rainfall\n during a Election Period in India", outer = TRUE, cex = 1.5)
+```
+
+### 1B
+
+```{r}
+# get lag by district
+dt[,total_rain_lag1 := shift(total_rain,type='lag',n=1),by=.(state,district)]
+dt[, avg_spi_lag1 := shift(avg_spi,type='lag',n=1),by=.(state,district)]
+
+# get neighbors means
+border_with_value <- as.data.table(left_join(borderdt,dt[,list(district = district,total_rain_lag1 = total_rain_lag1,avg_spi_lag1 = avg_spi_lag1,window=window),],by='district'))
+
+neighbor_mean <- border_with_value[!is.na(window)][,.(mean_neighbor_rain_lag1 = mean(total_rain_lag1,na.rm=TRUE),mean_neighbor_spi_lag1 = mean(avg_spi_lag1,na.rm = TRUE)),by=.(focal_district,window)]
+
+# merge table
+dt <- as.data.table(left_join(dt,neighbor_mean,by=c("district" = "focal_district","window"="window")))
+
+# get year difference
+syear2 <- syear
+syear2[syear2 == 1945] <- 1946
+yeardif <- eyear - syear2
+dt[,year_diff := as.numeric(unlist(lapply(window,function(x) yeardif[x]))),]
+
+
+# linear models
+rainfall_vs_lag1rainfall <- plm(total_rain ~ total_rain_lag1+year_diff,data=dt,effect = 'twoways',model='within',index='district')
+rainfall_vs_lag1rainfall_neighbor <- plm(total_rain ~ mean_neighbor_rain_lag1+year_diff,data=dt,effect = 'twoways',model='within',index='district')
+spi_vs_lag1spi <- plm(avg_spi ~ avg_spi_lag1+year_diff,data=dt,effect = 'twoways',model='within',index='district')
+spi_vs_lag1spi_neighbor <- plm(avg_spi ~ mean_neighbor_spi_lag1+year_diff,data=dt,effect = 'twoways',model='within',index='district')
+
+```
+
+Comparing the models yields
+
+```{r,results='asis'}
+stargazer(rainfall_vs_lag1rainfall,rainfall_vs_lag1rainfall_neighbor,spi_vs_lag1spi,spi_vs_lag1spi_neighbor,title = 'Results',align = TRUE,header=FALSE, type='html')
+```
+
+### 1C
+
+```{r}
+# get counts
+extreme_climate <- raindt[!is.na(spi),.(extreme_count = sum((spi < -1 | spi > 1),na.rm=TRUE)),by = .(district,window)]
+dt <- as.data.table(left_join(dt,extreme_climate,by=c("district" = "district","window"="window")))
+
+
+# get neighbor average
+dt[,extreme_count_lag1 := shift(extreme_count,type='lag',n=1),by=.(state,district)]
+border_with_count <- as.data.table(left_join(borderdt,dt[,list(district = district,extreme_count_lag1 = extreme_count_lag1,window=window),],by='district'))
+neighbor_mean_count <- border_with_count[!is.na(window)][,.(mean_neighbor_extreme_weather_lag1 = mean(extreme_count_lag1,na.rm=TRUE)),by=.(focal_district,window)]
+
+# merge table
+dt <- as.data.table(left_join(dt,neighbor_mean_count,by=c("district" = "focal_district","window"="window")))
+
+# linear model
+extreme_vs_lag1 <- pglm(extreme_count~ extreme_count_lag1+year_diff,data=dt,effect = 'twoways',model='within',index='district',family='poisson')
+extreme_vs_lag1_neighbor <- pglm(extreme_count~ mean_neighbor_extreme_weather_lag1+year_diff,data=dt,effect = 'twoways',model='within',index='district',family='poisson')
+
+```
+
+Comparing the models yields
+
+```{r,results='asis'}
+
+stargazer(coeftest(extreme_vs_lag1),coeftest(extreme_vs_lag1_neighbor),column.labels=c('current','current'),title = 'Results',align = TRUE,header=FALSE, type='html')
+```
+
+## 2
+
+```{r, warning=FALSE,message=FALSE}
+# linear model
+
+dt2 <- dt[!is.na(extreme_count) &!is.nan(extreme_count)]
+df2 <- as.data.frame(dt2)
+
+
+new_party_vs_count <- panelAR(new_parties ~ extreme_count + year_diff + year, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+
+```
+
+Summarizing Linear Model:
+
+```{r}
+summary(new_party_vs_count)
+```
+
+## 3
+
+```{r,message=FALSE}
+dt2 <- dt[!is.na(mean_neighbor_extreme_weather_lag1) & !is.nan(mean_neighbor_extreme_weather_lag1)]
+df2 <- as.data.frame(dt2)
+
+new_party_vs_count_and_neighbor <- panelAR(new_parties ~ extreme_count + year_diff + year  + mean_neighbor_extreme_weather_lag1, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+```
+
+
+Summarizing Linear Model:
+
+```{r}
+summary(new_party_vs_count_and_neighbor)
+```
+
+## 4
+
+### A
+
+```{r,message=FALSE,warning=FALSE}
+national_scope <-  panelAR(new_parties_national_scope ~ extreme_count + year_diff + year  + mean_neighbor_extreme_weather_lag1, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+state_scope <- panelAR(new_parties_state_scope ~ extreme_count + year_diff + year  + mean_neighbor_extreme_weather_lag1, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+regional_scope <- panelAR(new_parties_regional_scope ~ extreme_count + year_diff + year  + mean_neighbor_extreme_weather_lag1, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+```
+
+Comparing Linear Models
+
+```{r,results='asis'}
+stargazer(coeftest(national_scope),coeftest(state_scope),coeftest(regional_scope),column.labels=c('national','state','regional'),title = 'Results',align = TRUE,header=FALSE, type='html')
+```
+
+### B
+
+```{r,warning=FALSE,message=FALSE}
+political <- panelAR(political_concentration ~ extreme_count + year_diff + year  + mean_neighbor_extreme_weather_lag1, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+summary(political)
+```
+
+## 5
+
+```{r}
+## find likelihood of existed new party in neighbor
+party <- newParty[,list(district = district,year=year,party_name = party_name)]
+party[,window := as.factor(unlist(lapply(year, function(x) which(x == eyear)))),]
+border_with_new_party <- as.data.table(left_join(borderdt,party,by='district'))
+border_with_new_party_plus_focal <- as.data.table(left_join(border_with_new_party,party[,list(district=district,focal_window = as.numeric(as.character(window)),focal_party = party_name)],by=c('focal_district'='district')))[,window:=as.numeric(as.character(window))][!is.na(window) & !is.na(focal_window)]
+border_with_new_party_plus_focal <- na.omit(border_with_new_party_plus_focal)
+
+focal_likelihood <- border_with_new_party_plus_focal[,existence:= focal_window > window & focal_party == party_name]
+focal_likelihood <- unique(focal_likelihood[,list(focal_district=focal_district,focal_window=focal_window,existence = existence,party = focal_party)])[!(party == '' | party == ' ')][,.(existed_likelihood = sum(existence,na.rm = TRUE)),by = .(focal_district,focal_window)]
+
+focal_likelihood[,focal_district:=as.character(focal_district)]
+focal_likelihood[,focal_window:=as.character(focal_window)]
+
+
+## join back to original dataset
+dt <- as.data.table(left_join(dt,focal_likelihood,by=c("district"="focal_district","window"="focal_window")))
+dt <- dt[!duplicated(dt[,list(d=district,w=window)])]
+dt[,non_existed_likelihood := (new_parties - existed_likelihood)]
+dt[,existed_likelihood := (existed_likelihood)]
+dt <- dt[!is.na(existed_likelihood) & !is.na(non_existed_likelihood)&!is.na(mean_neighbor_extreme_weather_lag1)&!is.na(extreme_count) &!is.nan(extreme_count)]
+df2 <- as.data.frame(dt)
+```
+
+
+Build linear models:
+
+```{r,message=FALSE}
+existed <- panelAR(existed_likelihood ~ extreme_count + year_diff + year  + mean_neighbor_extreme_weather_lag1, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+non_existed <- panelAR(non_existed_likelihood ~ extreme_count + year_diff + year  + mean_neighbor_extreme_weather_lag1, data = df2, panelVar='district',timeVar='year',autoCorr = 'psar1',panelCorrMethod = 'phet',rho.na.rm = TRUE)
+```
+
+Comparing between models:
+
+```{r,results='asis'}
+stargazer(coeftest(existed),coeftest(non_existed),column.labels=c('existed','non-existed'),title = 'Results',align = TRUE,header=FALSE, type='html')
+```
+
